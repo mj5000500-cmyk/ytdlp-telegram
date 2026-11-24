@@ -347,6 +347,36 @@ class BackgroundWorker:
 
                     if not dl_results or not dl_results[0].success or not dl_results[0].path:
                         err = dl_results[0].error if dl_results else "Download returned no path"
+                        err_str = str(err).lower()
+
+                        # Check if YouTube is blocking / asking for login or cookies
+                        is_cookie_block = any(
+                            k in err_str
+                            for k in [
+                                "sign in to confirm",
+                                "cookies are invalid",
+                                "cookies expired",
+                                "login required",
+                                "requested format is not available",
+                                "too many requests",
+                                "429",
+                                "bot verification",
+                                "only images are available",
+                            ]
+                        )
+                        if is_cookie_block:
+                            logger.warning("YouTube auth/cookie restriction encountered on '%s'. Pausing worker.", job.video_id)
+                            self.is_paused = True
+                            await self.bot.send_message(
+                                self.target_chat_id,
+                                f"⚠️ **YouTube Cookies Expired or Blocked!**\n\n"
+                                f"Video **[{cur_num}/{tot_num}]** failed because YouTube is requesting fresh cookies or login verification.\n\n"
+                                f"⏸️ **Pipeline is paused at Video #{cur_num}.**\n"
+                                f"👉 **Please send your fresh `cookies.txt` file directly in this chat!**\n"
+                                f"As soon as you send it, the bot will automatically resume from Video **#{cur_num}** (all previous {stats['uploaded']} videos will remain safely skipped)!"
+                            )
+                            break
+
                         retries = self.state.record_failure(job.video_id, f"Download error: {err}")
                         logger.error("Download failed for '%s' (Attempt %d/3): %s", job.video_id, retries, err)
                         continue
@@ -403,7 +433,7 @@ class BackgroundWorker:
                     continue
 
                 msg_ids = ",".join(str(m) for m in upload_res.message_ids)
-                self.state.mark_uploaded(job.video_id, telegram_message_id=msg_ids)
+                self.state.mark_uploaded(job.video_id, telegram_message_id=msg_ids, title=job.title, playlist_url=job.playlist_url)
                 logger.info("Successfully uploaded '%s' (Msg IDs: %s)", job.video_id, msg_ids)
 
             if processed_in_this_run > 0:
@@ -619,6 +649,14 @@ async def handle_incoming_message(event: events.NewMessage.Event) -> None:
                 f"✅ _yt-dlp will now use these cookies for all subsequent downloads._"
             )
             logger.info("Cookies updated from file by owner. Found %d YouTube entries.", yt_entries)
+
+            # Auto-resume or trigger background worker if there are pending jobs
+            if worker.is_paused:
+                worker.resume()
+                await event.reply("▶️ **New cookies applied! Resuming playlist automatically from where it stopped...**")
+            elif not worker.is_running and state.get_next_pending_job():
+                worker.trigger()
+                await event.reply("🚀 **New cookies applied! Continuing pending playlist videos...**")
             return
         except Exception as e:
             logger.error("Failed saving cookies file: %s", e)
@@ -816,21 +854,47 @@ async def handle_incoming_message(event: events.NewMessage.Event) -> None:
             quality = args[1] if len(args) > 1 else "1080"
             items = args[2] if len(args) > 2 else None
 
-            init_msg = await event.reply("🔍 Scanning playlist metadata...")
+            init_msg = await event.reply("🔍 Scanning playlist metadata & checking recent downloads...")
             try:
                 from pipeline import discover_and_enqueue_url
                 loop = asyncio.get_running_loop()
-                title, new_cnt, tot_cnt = await loop.run_in_executor(
+                res = await loop.run_in_executor(
                     None,
                     lambda: discover_and_enqueue_url(url=url, state=state, quality=quality, playlist_items=items),
                 )
+                title = res["title"]
+                tot_cnt = res["total"]
+                new_cnt = res["new_count"]
+                skip_cnt = res["skipped_count"]
+                resume_idx = res.get("resume_index")
+                first_title = res.get("first_pending_title")
+
+                if tot_cnt > 1 and new_cnt == 0 and skip_cnt > 0:
+                    await init_msg.edit(
+                        f"✅ **All Videos Already Completed!**\n\n"
+                        f"🎬 **Playlist:** {title}\n"
+                        f"🔢 **Total in Playlist:** {tot_cnt}\n"
+                        f"⏩ **Completed Recently:** {skip_cnt} video(s)\n\n"
+                        f"✨ All videos from this playlist have already been downloaded & uploaded recently! Nothing left to download.\n"
+                        f"_(If you want to re-download from scratch, send /cleardb)_"
+                    )
+                    return
+
+                resume_block = ""
+                if skip_cnt > 0 and resume_idx:
+                    resume_block = (
+                        f"⏩ **Already Completed (Skipped):** `{skip_cnt}` video(s) (Downloaded recently)\n"
+                        f"▶️ **Resuming From:** Video **#{resume_idx}** (`{first_title[:35]}...`)\n"
+                    )
+
                 await init_msg.edit(
                     f"📋 **Playlist Enqueued!**\n\n"
-                    f"• **Title:** {title}\n"
-                    f"• **New Videos:** {new_cnt}\n"
-                    f"• **Total Detected:** {tot_cnt}\n"
-                    f"• **Quality:** {quality}\n\n"
-                    f"🚀 Starting background processing..."
+                    f"🎬 **Title:** {title}\n"
+                    f"🔢 **Total in Playlist:** {tot_cnt}\n"
+                    f"{resume_block}"
+                    f"📥 **Remaining to Download:** `{new_cnt}` video(s)\n"
+                    f"📹 **Quality:** {quality}\n\n"
+                    f"🚀 {'Resuming from where it stopped!' if skip_cnt > 0 else 'Starting sequential processing...'}"
                 )
                 worker.trigger()
             except Exception as e:
@@ -1010,17 +1074,44 @@ async def handle_callback_query(event: events.CallbackQuery.Event) -> None:
             try:
                 from pipeline import discover_and_enqueue_url
                 loop = asyncio.get_running_loop()
-                title, new_cnt, tot_cnt = await loop.run_in_executor(
+                res = await loop.run_in_executor(
                     None,
                     lambda: discover_and_enqueue_url(url=url, state=state, quality=quality),
                 )
+                title = res["title"]
+                tot_cnt = res["total"]
+                new_cnt = res["new_count"]
+                skip_cnt = res["skipped_count"]
+                resume_idx = res.get("resume_index")
+                first_title = res.get("first_pending_title")
+
+                if tot_cnt > 1 and new_cnt == 0 and skip_cnt > 0:
+                    await event.edit(
+                        f"✅ **All Videos Already Completed!**\n\n"
+                        f"🎬 **Playlist:** {title}\n"
+                        f"🔢 **Total in Playlist:** {tot_cnt}\n"
+                        f"⏩ **Completed Recently:** {skip_cnt} video(s)\n\n"
+                        f"✨ All videos from this playlist have already been downloaded & uploaded recently! Nothing left to download.\n"
+                        f"_(If you want to re-download from scratch, send /cleardb)_",
+                        buttons=None,
+                    )
+                    return
+
+                resume_block = ""
+                if skip_cnt > 0 and resume_idx:
+                    resume_block = (
+                        f"⏩ **Already Completed (Skipped):** `{skip_cnt}` video(s) (Downloaded recently)\n"
+                        f"▶️ **Resuming From:** Video **#{resume_idx}** (`{first_title[:35]}...`)\n"
+                    )
+
                 await event.edit(
                     f"📋 **Playlist Enqueued!**\n\n"
-                    f"• **Title:** {title}\n"
-                    f"• **New Videos:** {new_cnt}\n"
-                    f"• **Total Detected:** {tot_cnt}\n"
-                    f"• **Quality:** {quality}\n\n"
-                    f"🚀 Sequential processing started in background!",
+                    f"🎬 **Title:** {title}\n"
+                    f"🔢 **Total in Playlist:** {tot_cnt}\n"
+                    f"{resume_block}"
+                    f"📥 **Remaining to Download:** `{new_cnt}` video(s)\n"
+                    f"📹 **Quality:** {quality}\n\n"
+                    f"🚀 {'Resuming from where it stopped!' if skip_cnt > 0 else 'Sequential processing started in background!'}",
                     buttons=None,
                 )
                 worker.trigger()

@@ -13,10 +13,52 @@ Stores video download/upload state in jobs.db:
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+HISTORY_FILE = Path(__file__).resolve().parent / "completed_history.json"
+
+
+def record_completed_history(video_id: str, title: str, playlist_url: Optional[str] = None) -> None:
+    """Records video completion in persistent history file with timestamp."""
+    try:
+        data = {}
+        if HISTORY_FILE.exists():
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data[video_id] = {
+            "title": title,
+            "playlist_url": playlist_url,
+            "timestamp": time.time(),
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "uploaded",
+        }
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def is_in_completed_history(video_id: str, max_age_minutes: int = 60) -> bool:
+    """Checks if video was completed recently in persistent history."""
+    if not HISTORY_FILE.exists():
+        return False
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if video_id in data:
+            entry = data[video_id]
+            ts = entry.get("timestamp", 0)
+            if (time.time() - ts) <= (max_age_minutes * 60):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 @dataclass
@@ -94,6 +136,70 @@ class StateManager:
             )
             conn.commit()
 
+    def is_video_uploaded_recently(self, video_id: str, max_age_minutes: int = 60) -> bool:
+        """
+        Checks if a video was already marked 'uploaded' recently (within max_age_minutes).
+        """
+        if is_in_completed_history(video_id, max_age_minutes=max_age_minutes):
+            return True
+
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT status, updated_at
+                FROM jobs
+                WHERE video_id = ? AND status = 'uploaded'
+                """,
+                (video_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+
+            up_at = row["updated_at"]
+            if not up_at:
+                return True
+
+            try:
+                dt = datetime.strptime(str(up_at).split(".")[0], "%Y-%m-%d %H:%M:%S")
+                age_sec = (datetime.utcnow() - dt).total_seconds()
+                return age_sec <= (max_age_minutes * 60)
+            except Exception:
+                return True
+
+    def ensure_uploaded(
+        self,
+        video_id: str,
+        playlist_url: str,
+        title: str,
+        quality: str = "1080",
+        playlist_title: Optional[str] = None,
+    ) -> None:
+        """Ensures video is registered as 'uploaded' in SQLite so queue skips it."""
+        with self._get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT status FROM jobs WHERE video_id = ?", (video_id,))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'uploaded', updated_at = CURRENT_TIMESTAMP
+                    WHERE video_id = ?
+                    """,
+                    (video_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO jobs (playlist_url, playlist_title, video_id, title, quality, status)
+                    VALUES (?, ?, ?, ?, ?, 'uploaded')
+                    """,
+                    (playlist_url, playlist_title, video_id, title, quality),
+                )
+            conn.commit()
+
     def add_job(
         self,
         playlist_url: str,
@@ -101,32 +207,52 @@ class StateManager:
         title: str,
         quality: str = "1080",
         playlist_title: Optional[str] = None,
-    ) -> bool:
+        max_skip_age_minutes: int = 60,
+    ) -> Tuple[bool, bool]:
         """
-        Inserts a new video job if not already present.
-        If already present and NOT 'uploaded' (e.g. was failed or cancelled),
-        resets it back to 'queued' so it will be retried automatically!
-        Returns True if newly inserted or re-queued, False if already uploaded.
+        Inserts a new video job or resets previous failures.
+        Returns: (is_queued: bool, was_skipped: bool)
+        - If already 'uploaded' within max_skip_age_minutes: returns (False, True) -> Skipped!
+        - If previously failed or cancelled: resets to 'queued' -> returns (True, False)
+        - If new: inserts as 'queued' -> returns (True, False)
         """
+        # Check persistent history file first
+        if is_in_completed_history(video_id, max_age_minutes=max_skip_age_minutes):
+            self.ensure_uploaded(video_id, playlist_url, title, quality, playlist_title)
+            return False, True
+
         with self._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT status FROM jobs WHERE video_id = ?", (video_id,))
+            cur.execute("SELECT status, updated_at FROM jobs WHERE video_id = ?", (video_id,))
             row = cur.fetchone()
             if row:
                 st = row["status"]
-                if st != "uploaded":
-                    cur.execute(
-                        """
-                        UPDATE jobs
-                        SET status = 'queued', retry_count = 0, error = NULL, quality = ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE video_id = ?
-                        """,
-                        (quality, video_id),
-                    )
-                    conn.commit()
-                    return True
-                return False
+                if st == "uploaded":
+                    up_at = row["updated_at"]
+                    is_recent = True
+                    if up_at:
+                        try:
+                            dt = datetime.strptime(str(up_at).split(".")[0], "%Y-%m-%d %H:%M:%S")
+                            age_sec = (datetime.utcnow() - dt).total_seconds()
+                            is_recent = (age_sec <= max_skip_age_minutes * 60)
+                        except Exception:
+                            is_recent = True
+                    if is_recent:
+                        return False, True
 
+                # If was failed or cancelled or not recent, reset to queued
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'queued', retry_count = 0, error = NULL, quality = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE video_id = ?
+                    """,
+                    (quality, video_id),
+                )
+                conn.commit()
+                return True, False
+
+            # Completely new video
             cur.execute(
                 """
                 INSERT INTO jobs 
@@ -136,7 +262,7 @@ class StateManager:
                 (playlist_url, playlist_title, video_id, title, quality),
             )
             conn.commit()
-            return True
+            return True, False
 
     def clear_database(self) -> int:
         """Deletes all jobs from database. Returns number of deleted rows."""
@@ -194,8 +320,14 @@ class StateManager:
         """Marks video as currently uploading to Telegram."""
         self._update_status(video_id, status="uploading")
 
-    def mark_uploaded(self, video_id: str, telegram_message_id: str) -> None:
-        """Marks video as fully uploaded with Telegram message ID."""
+    def mark_uploaded(
+        self,
+        video_id: str,
+        telegram_message_id: str,
+        title: Optional[str] = None,
+        playlist_url: Optional[str] = None,
+    ) -> None:
+        """Marks video as fully uploaded with Telegram message ID and records to history."""
         self._update_status(
             video_id,
             status="uploaded",
@@ -203,6 +335,14 @@ class StateManager:
             file_path=None,
             error=None,
         )
+        if not title:
+            job = self.get_job(video_id)
+            if job:
+                title = job.title
+                playlist_url = job.playlist_url
+
+        if title:
+            record_completed_history(video_id, title, playlist_url)
 
     def record_failure(
         self,

@@ -624,6 +624,30 @@ class TelegramUploader:
                 self._channel_entity = self.channel_id
         return self._channel_entity or self.channel_id
 
+    async def get_recent_uploaded_video_titles(self, max_age_minutes: int = 60, limit: int = 50) -> Set[str]:
+        """Scans recent messages from target channel to detect recently uploaded videos."""
+        uploaded_set: Set[str] = set()
+        if not self.client or not self.client.is_connected():
+            return uploaded_set
+        try:
+            target_entity = await self.get_target_entity()
+            now = time.time()
+            cutoff = now - (max_age_minutes * 60)
+            async for msg in self.client.iter_messages(target_entity, limit=limit):
+                if not msg.date:
+                    continue
+                if msg.date.timestamp() < cutoff:
+                    break
+                text = msg.text or msg.message or ""
+                if text:
+                    for line in text.split("\n"):
+                        clean_line = line.strip().lower()
+                        if clean_line:
+                            uploaded_set.add(clean_line)
+        except Exception as e:
+            logger.debug("Channel scan for recent uploads skipped: %s", e)
+        return uploaded_set
+
     async def disconnect(self) -> None:
         """Gracefully disconnects the client."""
         if self.client and self.client.is_connected():

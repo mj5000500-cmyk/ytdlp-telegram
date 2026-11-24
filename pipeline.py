@@ -23,17 +23,27 @@ from uploader import TelegramUploader
 
 
 
+class EnqueueResult(dict):
+    """Result dictionary that can also be unpacked as (title, new_count, total) for backwards compatibility."""
+
+    def __iter__(self):
+        return iter((self["title"], self["new_count"], self["total"]))
+
+
 def discover_and_enqueue_url(
     url: str,
     state: StateManager,
     quality: str = "1080",
     playlist_items: Optional[str] = None,
     playlist_reverse: bool = False,
-) -> Tuple[str, int, int]:
+    recent_channel_titles: Optional[Set[str]] = None,
+    max_skip_age_minutes: int = 60,
+) -> EnqueueResult:
     """
     Extracts video metadata from a playlist or single URL in seconds using flat extraction.
-    Enqueues items into SQLite jobs.db.
-    Returns: (playlist_title, newly_enqueued_count, total_discovered_count)
+    Checks whether videos were already completed recently (in last 30-60 min).
+    Skips completed videos and queues remaining videos from where it stopped.
+    Returns EnqueueResult with total, skipped, and resume position.
     """
     from downloader_v4 import find_tool_path
     check_required_tools(TOOLS_DIR)
@@ -83,26 +93,53 @@ def discover_and_enqueue_url(
         video_list = [info]
         playlist_title = "Single Video"
 
-    new_count = 0
     total_count = len(video_list)
+    new_count = 0
+    skipped_count = 0
+    skipped_videos: List[Tuple[int, str]] = []
+    queued_videos: List[Tuple[int, str]] = []
 
-    for item in video_list:
+    for idx, item in enumerate(video_list, start=1):
         vid_id = item.get("id") or ""
         vid_title = item.get("title") or "Unknown Title"
         if not vid_id:
             continue
 
-        inserted = state.add_job(
+        # Check if matched in channel recent titles
+        if recent_channel_titles:
+            vt_lower = vid_title.strip().lower()
+            if any(vt_lower in ch or ch in vt_lower for ch in recent_channel_titles):
+                state.ensure_uploaded(vid_id, url, vid_title, quality, playlist_title)
+                from state import record_completed_history
+                record_completed_history(vid_id, vid_title, url)
+
+        is_queued, is_skipped = state.add_job(
             playlist_url=url,
             video_id=vid_id,
             title=vid_title,
             quality=quality,
             playlist_title=playlist_title,
+            max_skip_age_minutes=max_skip_age_minutes,
         )
-        if inserted:
-            new_count += 1
 
-    return playlist_title, new_count, total_count
+        if is_skipped:
+            skipped_count += 1
+            skipped_videos.append((idx, vid_title))
+        elif is_queued:
+            new_count += 1
+            queued_videos.append((idx, vid_title))
+
+    resume_index = queued_videos[0][0] if queued_videos else None
+    first_pending_title = queued_videos[0][1] if queued_videos else None
+
+    return EnqueueResult(
+        title=playlist_title,
+        total=total_count,
+        new_count=new_count,
+        skipped_count=skipped_count,
+        resume_index=resume_index,
+        first_pending_title=first_pending_title,
+    )
 
 
 async def run_pipeline(playlist_url: Optional[str] = None) -> None:
